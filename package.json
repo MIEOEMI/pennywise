@@ -1,7 +1,7 @@
 {
   "name": "pennywise",
-  "version": "0.1.0",
-  "description": "PennyWise —— 本地记账 CLI：支出/收入/月度汇总/预算，零依赖，数据存本地 JSON",
+  "version": "0.2.0",
+  "description": "PennyWise —— 本地记账 CLI：支出/收入/汇总/预算/账单导入导出/隐私处理，零依赖，数据存本地 JSON",
   "bin": {
     "pennywise": "bin/pennywise.js"
   },
@@ -17,6 +17,7 @@
     "expense",
     "budget",
     "money",
+    "export",
     "记账"
   ],
   "license": "MIT",
