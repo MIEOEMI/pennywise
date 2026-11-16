@@ -47,7 +47,8 @@ SEEN_LOG = os.path.join(HOME, ".pennywise", "fetch-bills.log")
 
 FROM_FILTERS = ("bank@163.com", "bill@163.com")
 SUBJECT_KEYWORDS = ("账单", "对账单", "交易明细", "流水", "bill", "statement")
-BILL_EXTS = (".csv", ".json", ".xlsx", ".xls")
+BILL_EXTS = (".zip", ".csv", ".json", ".xlsx", ".xls")  # fetch 只投递，zip 由 ingest 解
+ZIP_EXTS = (".zip",)
 
 # 账单正文常见 CSV 表头片段（无附件时据此判断正文即账单）
 CSV_HEADER_HINTS = ("日期", "金额", "交易时间", "交易金额", "date", "amount")
@@ -123,6 +124,41 @@ def parts_of(msg):
     return out
 
 
+def html_of(msg):
+    """取第一个 text/html 部分（没有则 None）。"""
+    for p in parts_of(msg):
+        if (p.get_content_type() or "").lower() == "text/html":
+            blob = p.get_payload(decode=True)
+            if blob:
+                charset = p.get_content_charset() or "utf-8"
+                return blob.decode(charset, "replace")
+    return None
+
+
+WECHAT_LINK_RE = re.compile(
+    r'https?://[^\s"\'<>]+downloadfilefromemail[^\s"\'<>]+', re.I
+)
+
+
+def wechat_download(html):
+    """微信账单邮件正文里的下载链接 → 下载 ZIP 字节。失败返回 None。"""
+    if not html:
+        return None
+    m = WECHAT_LINK_RE.search(html)
+    if not m:
+        return None
+    url = m.group(0).replace("&amp;", "&")
+    try:
+        import urllib.request
+
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read()
+    except Exception as e:
+        log(f"  ⚠ 微信账单下载失败：{e}")
+        return None
+
+
 def pick_payloads(msg):
     """从一封信里提取：账单附件列表 + 可能是账单的正文字节。"""
     atts = []
@@ -193,6 +229,11 @@ def main():
             continue
 
         atts, body_csv = pick_payloads(msg)
+        # 微信支付账单邮件不带附件，正文 HTML 里有下载链接（ZIP 是 xlsx、有密码）
+        if not atts and "wechatpay" in sender and "downloadfilefromemail" in (html_of(msg) or ""):
+            blob = wechat_download(html_of(msg))
+            if blob:
+                atts.append((f"wechat-bill-{uid}.zip", blob))
         if not atts and not body_csv:
             continue  # 关键词命中但没有账单内容，不动它
 

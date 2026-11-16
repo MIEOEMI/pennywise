@@ -6,6 +6,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const cp = require('node:child_process');
 const crypto = require('node:crypto');
 
 const VERSION = '0.2.0';
@@ -128,10 +129,12 @@ function monthOr(opts) {
   return m;
 }
 function normalizeType(s) {
-  if (!s) return undefined;
-  const t = String(s).toLowerCase();
-  if (t === 'expense' || s === '支出') return 'expense';
-  if (t === 'income' || s === '收入') return 'income';
+  if (s === undefined || s === null || s === '') return undefined;
+  const t = String(s).trim().toLowerCase();
+  if (t === 'expense' || s === '支出' || s === '支出' || t === 'out') return 'expense';
+  if (t === 'income' || s === '收入' || t === 'in') return 'income';
+  /* 支付宝「不计收支」/「其他」等中性记录：不算支出也不算收入，跳过不报错 */
+  if (/不计收支|中性交易|other|neutral/.test(t)) return 'skip';
   return null;
 }
 function checkFilterDates(opts) {
@@ -145,7 +148,7 @@ function filterEntries(es, opts) {
   if (opts.cat) out = out.filter((e) => (e.category || '') === opts.cat);
   if (opts.type !== undefined) {
     const t = normalizeType(opts.type);
-    if (!t) fail(`--type 应为 expense|income（或 支出|收入），收到：${opts.type}`);
+    if (!t || t === 'skip') fail(`--type 应为 expense|income（或 支出|收入），收到：${opts.type}`);
     out = out.filter((e) => e.type === t);
   }
   if (opts.from) out = out.filter((e) => e.date >= opts.from);
@@ -321,10 +324,15 @@ function sanitizeEntry(raw, existingIds) {
   let type = raw.type;
   if (type === '支出') type = 'expense';
   if (type === '收入') type = 'income';
+  const norm = normalizeType(type);
+  if (norm === 'skip' || norm === undefined) return { skip: true }; // 中性/缺类型：安静跳过，不算无效
+  /* 「交易关闭」= 钱未实际扣/已全额退回，官方统计不计入支出（如押金充值失败） */
+  if (/关闭|closed/i.test(String(raw.status || ''))) return { skip: true };
+  if (norm) type = norm;
   if (type !== 'expense' && type !== 'income') return { reason: 'type 非法' };
-  const amount = Number(raw.amount);
+  const amount = Number(cleanAmount(raw.amount));
   if (!Number.isFinite(amount) || amount <= 0) return { reason: '金额非法' };
-  const date = String(raw.date || '');
+  const date = String(raw.date || '').trim().slice(0, 10);
   if (!validDate(date)) return { reason: `日期非法（${date}）` };
   let id = typeof raw.id === 'string' && /^[0-9a-f-]{8,}$/.test(raw.id) ? raw.id : crypto.randomUUID();
   if (existingIds.has(id)) id = crypto.randomUUID();   // 撞 ID 就换新的
@@ -361,10 +369,11 @@ function cmdMerge(opts) {
   const dupKey = (e) => `${e.date}|${e.type}|${e.amount}|${e.category}|${e.note}|${e.merchant}`;
   const seen = new Set(d.entries.map(dupKey));
 
-  let added = 0, skippedDup = 0, skippedBad = 0;
+  let added = 0, skippedDup = 0, skippedBad = 0, skippedNeutral = 0;
   const badReasons = new Map();
   for (const raw of incoming) {
-    const { entry, reason } = sanitizeEntry(raw, existingIds);
+    const { entry, skip, reason } = sanitizeEntry(raw, existingIds);
+    if (skip) { skippedNeutral++; continue; }
     if (!entry) {
       skippedBad++;
       badReasons.set(reason, (badReasons.get(reason) || 0) + 1);
@@ -377,6 +386,7 @@ function cmdMerge(opts) {
   }
   save(d);
   ok(`合并完成：新增 ${added} 条${skippedDup ? ` · 跳过重复 ${skippedDup} 条` : ''}`
+    + `${skippedNeutral ? ` · 不计收支 ${skippedNeutral} 条` : ''}`
     + `${skippedBad ? ` · 跳过无效 ${skippedBad} 条` : ''}${opts.force ? '（--force 未去重）' : ''}`);
   for (const [r, n] of badReasons) console.log(paint(`    ${r} ×${n}`, DIM));
 }
@@ -448,8 +458,11 @@ function cmdExport(opts) {
   }
 }
 
-/* ---------- ingest：扫描收件箱 ~/.pennywise/inbox/，导入 json/csv 账单 ----------
-   成功的文件移入 inbox/processed/，解析失败的移入 inbox/failed/（保留现场） */
+/* ---------- ingest：扫描收件箱 ~/.pennywise/inbox/，导入 json/csv/zip 账单 ----------
+   成功的文件移入 inbox/processed/，解析失败的移入 inbox/failed/（保留现场）
+   ZIP（微信/支付宝/银行账单邮件的标准格式）：用系统 unzip 解出里面的 csv/json/xlsx 再解析；
+   密码取 ~/.pennywise/zip-passwords.txt（每行一个，依次尝试）。
+   xlsx 是 zip 容器：从中提取 sheet1 的共享字符串 + 行内单元格引用拼成 CSV。 */
 function splitCsvLine(line) {
   const cells = []; let cur = ''; let inQ = false;
   for (let i = 0; i < line.length; i++) {
@@ -465,25 +478,143 @@ function splitCsvLine(line) {
   cells.push(cur);
   return cells;
 }
-const CSV_COLS = { 日期: 'date', date: 'date', 时间: 'date', 类型: 'type', type: 'type',
-  收支: 'type', 金额: 'amount', amount: 'amount', 分类: 'category', category: 'category',
-  商家: 'merchant', merchant: 'merchant', 备注: 'note', note: 'note', 摘要: 'note' };
+/* 表头模糊匹配：微信账单是「交易时间/收/支/金额(元)/交易对方」，
+   支付宝是「交易创建时间/收/支/金额」，都对齐到 date/type/amount/merchant/note/category */
+const CSV_PATTERNS = [
+  [/^(交易时间|交易创建时间|交易日期|日期|date|时间)$/, 'date'],
+  [/金额|amount/, 'amount'],
+  [/^(收\/?支|交易类型|类型|type|收支)$/, 'type'],
+  [/交易对方|商家|merchant|对方/, 'merchant'],
+  [/^(备注|note|摘要)$/, 'note'],
+  [/^(交易分类|分类|category|类别)$/, 'category'],
+  [/^(商品说明|商品|说明)$/, 'note'],
+  [/^(交易状态|状态|status)$/, 'status'],
+];
+function mapHeader(h) {
+  const n = String(h || '').toLowerCase().replace(/[\s（）()]/g, '');
+  for (const [re, field] of CSV_PATTERNS) if (re.test(n)) return field;
+  return null;
+}
+function cleanAmount(s) {
+  return String(s ?? '').replace(/[¥￥$,\s]/g, '');
+}
+function decodeMaybeGbk(buf) {
+  const utf8 = buf.toString('utf8');
+  if (!utf8.includes('\uFFFD')) return utf8;   // 没有替换符就是干净的 utf8
+  try { return new TextDecoder('gbk').decode(buf); } catch (_) { return utf8; }
+}
+/* 表头映射 + 行对象化（CSV 文本与 xlsx 二维数组共用）：
+   表头行不一定是第 1 行（微信/支付宝账单前 N 行是账户说明），
+   找第一行能映射出 date+amount 两列的行当表头。 */
+function headerMapFromCells(cells) {
+  const mapped = cells.map(mapHeader);
+  return mapped.includes('date') && mapped.includes('amount') ? mapped : null;
+}
+const EXCEL_EPOCH = Date.UTC(1899, 11, 30); // Excel 日期序列号起点（含 1900 闰年 bug 偏移）
+function excelDateToISO(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 20000 || n > 80000) return String(v || '');
+  const d = new Date(EXCEL_EPOCH + Math.round(n * 86400000));
+  const pad = (x) => String(x).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+}
+function rowsToEntries(rows) {
+  let cols = null, headerIdx = -1;
+  for (let i = 0; i < Math.min(rows.length, 40); i++) {
+    const hm = headerMapFromCells(rows[i]);
+    if (hm) { cols = hm; headerIdx = i; break; }
+  }
+  if (!cols) throw new Error('表头里找不到日期列和金额列');
+  return rows.slice(headerIdx + 1).map((cells) => {
+    const o = {};
+    cols.forEach((c, i) => { if (c && cells[i] !== undefined) o[c] = String(cells[i]).trim(); });
+    if (o.date) {
+      o.date = excelDateToISO(String(o.date).trim());
+      o.date = o.date.replace(/\//g, '-').slice(0, 10);
+    }
+    if (o.amount) o.amount = cleanAmount(o.amount);
+    /* 微信用 / 表示空值：清掉，避免订单号/商家变成字面 "/" */
+    for (const k of Object.keys(o)) if (o[k] === '/') o[k] = '';
+    return o;
+  });
+}
 function parseCsv(text) {
   const lines = text.split(/\r?\n/).filter((l) => l.trim());
   if (lines.length < 2) throw new Error('CSV 至少要有表头和一行数据');
-  const cols = splitCsvLine(lines[0]).map((h) => CSV_COLS[h.trim()] || CSV_COLS[h.trim().toLowerCase()] || null);
-  return lines.slice(1).map((line) => {
-    const cells = splitCsvLine(line);
-    const o = {};
-    cols.forEach((c, i) => { if (c && cells[i] !== undefined) o[c] = String(cells[i]).trim(); });
-    if (o.date) o.date = o.date.replace(/\//g, '-').slice(0, 10);
-    return o;
-  });
+  return rowsToEntries(lines.map(splitCsvLine));
+}
+/* xlsx 是 zip 容器：无需第三方库，直接解析 sharedStrings.xml + sheet1 的行内
+   单元格引用拼出二维表。支持字符串(共享表/内联)与数字单元格，导出为 CSV 行。 */
+function xmlDecode(s) {
+  return String(s)
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'").replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(+d));
+}
+function matchAll(text, re) {
+  const out = []; let m;
+  while ((m = re.exec(text)) !== null) out.push(m);
+  return out;
+}
+function colLettersToIndex(letters) {
+  let n = 0;
+  for (const ch of letters) n = n * 26 + (ch.charCodeAt(0) - 64);
+  return n - 1;
+}
+function parseXlsx(buf) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-xlsx-'));
+  try {
+    fs.writeFileSync(path.join(tmp, 'in.xlsx'), buf);
+    const r = cp.spawnSync('unzip', ['-o', '-j', path.join(tmp, 'in.xlsx'),
+      'xl/sharedStrings.xml', 'xl/worksheets/sheet1.xml', '-d', tmp],
+      { encoding: 'buffer' });
+    if (r.status !== 0) throw new Error('xlsx 解压失败（不是标准 xlsx？）');
+    /* 按 <si> 块解析：富文本单元格一个 si 里有多个 <t>，必须合并成一个字符串，
+       否则索引错位（微信账单 count=690 / uniqueCount=231 就是这种情况） */
+    const shared = matchAll(
+      fs.readFileSync(path.join(tmp, 'sharedStrings.xml'), 'utf8'),
+      /<si>([\s\S]*?)<\/si>/g,
+    ).map((m) => matchAll(m[1], /<t[^>]*>([\s\S]*?)<\/t>/g)
+      .map((t) => xmlDecode(t[1])).join(''));
+    const sheet = fs.readFileSync(path.join(tmp, 'sheet1.xml'), 'utf8');
+    const rows = [];
+    for (const rowM of matchAll(sheet, /<row[^>]*>([\s\S]*?)<\/row>/g)) {
+      const cells = [];
+      /* 属性必须单独抓：之前把 t="s" 放进可选组，惰性匹配会跳过它，
+         导致共享字符串引用没解析、单元格值全是索引号 */
+      for (const cM of matchAll(rowM[1], /<c\s+([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)) {
+        const attrs = cM[1];
+        const inner = cM[2] || '';
+        const rM = /r="([A-Z]+)(\d+)"/.exec(attrs);
+        const tM = /t="(\w+)"/.exec(attrs);
+        if (!rM) continue;
+        const letters = rM[1];
+        const t = tM ? tM[1] : undefined;
+        let v = '';
+        const vM = /<v>([\s\S]*?)<\/v>/.exec(inner);
+        const isM = /<is>[\s\S]*?<t[^>]*>([\s\S]*?)<\/t>[\s\S]*?<\/is>/.exec(inner);
+        if (t === 's' && vM) v = shared[+vM[1]] ?? '';
+        else if (t === 'inlineStr' && isM) v = xmlDecode(isM[1]);
+        else if (vM) v = xmlDecode(vM[1]);
+        const idx = colLettersToIndex(letters);
+        cells[idx] = v;
+      }
+      rows.push(cells);
+    }
+    if (!rows.length) throw new Error('xlsx 没有数据行');
+    const width = Math.max(...rows.map((r) => r.length));
+    return rows.map((r) => {
+      const out = [];
+      for (let i = 0; i < width; i++) out.push(r[i] === undefined ? '' : r[i]);
+      return out;
+    });
+  } finally {
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) { /* 忽略 */ }
+  }
 }
 function cmdIngest() {
   const inbox = path.join(DATA_DIR, 'inbox');
   if (!fs.existsSync(inbox)) { console.log(paint('收件箱为空（没有 ~/.pennywise/inbox/）', DIM)); return; }
-  const files = fs.readdirSync(inbox).filter((f) => /\.(json|csv)$/i.test(f)).sort();
+  const files = fs.readdirSync(inbox).filter((f) => /\.(json|csv|zip)$/i.test(f)).sort();
   if (!files.length) { console.log(paint('收件箱为空（没有待导入账单）', DIM)); return; }
   const procDir = path.join(inbox, 'processed');
   const failDir = path.join(inbox, 'failed');
@@ -493,38 +624,82 @@ function cmdIngest() {
   const existingIds = new Set(d.entries.map((e) => e.id));
   const dupKey = (e) => `${e.date}|${e.type}|${e.amount}|${e.category}|${e.note}|${e.merchant}`;
   const seen = new Set(d.entries.map(dupKey));
-  let totalAdded = 0, totalDup = 0, totalBad = 0;
+  let totalAdded = 0, totalDup = 0, totalBad = 0, totalSkipped = 0;
+  /* ZIP 密码候选：~/.pennywise/zip-passwords.txt 每行一个 */
+  const zipPasswords = [''];
+  const pwFile = path.join(DATA_DIR, 'zip-passwords.txt');
+  if (fs.existsSync(pwFile)) {
+    for (const line of fs.readFileSync(pwFile, 'utf8').split(/\r?\n/)) {
+      const p = line.trim();
+      if (p) zipPasswords.push(p);
+    }
+  }
+  function extractZip(full, f) {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-zip-'));
+    try {
+      for (const pw of zipPasswords) {
+        const args = ['-o', '-j'];                     // 覆盖、去掉目录结构
+        if (pw) args.push('-P', pw);
+        args.push(full, '-d', work);
+        const r = cp.spawnSync('unzip', args, { encoding: 'buffer' });
+        if (r.status === 0) {
+          const members = fs.readdirSync(work).filter((m) => /\.(json|csv|xlsx|xls)$/i.test(m));
+          if (!members.length) throw new Error('ZIP 里没有 json/csv/xlsx 账单');
+          return members.map((m) => ({
+            name: `${f}::${m}`,
+            text: /\.(xlsx|xls)$/i.test(m) ? undefined : decodeMaybeGbk(fs.readFileSync(path.join(work, m))),
+            buf: /\.(xlsx|xls)$/i.test(m) ? fs.readFileSync(path.join(work, m)) : undefined,
+          }));
+        }
+      }
+      throw new Error('unzip 解压失败（密码不对或文件损坏）');
+    } finally {
+      try { fs.rmSync(work, { recursive: true, force: true }); } catch (_) { /* 忽略 */ }
+    }
+  }
   for (const f of files) {
     const full = path.join(inbox, f);
     try {
-      const text = fs.readFileSync(full, 'utf8');
-      let incoming;
-      if (/\.json$/i.test(f)) {
-        const parsed = JSON.parse(text);
-        incoming = Array.isArray(parsed) ? parsed : parsed.entries;
+      let incoming;                                    // [ {name, text} ]，统一成文件形态
+      if (/\.zip$/i.test(f)) {
+        incoming = extractZip(full, f);
       } else {
-        incoming = parseCsv(text);
+        incoming = [{ name: f, text: fs.readFileSync(full, 'utf8') }];
       }
-      if (!Array.isArray(incoming)) throw new Error('文件里没有记录数组');
-      let added = 0, dup = 0, bad = 0;
-      for (const raw of incoming) {
-        const { entry } = sanitizeEntry(raw, existingIds);
-        if (!entry) { bad++; continue; }
-        if (seen.has(dupKey(entry))) { dup++; continue; }
-        seen.add(dupKey(entry));
-        d.entries.push(entry);
-        added++;
+      let added = 0, dup = 0, bad = 0, skipped = 0;
+      for (const part of incoming) {
+        let rows;
+        if (/\.json$/i.test(part.name)) {
+          const parsed = JSON.parse(part.text);
+          rows = Array.isArray(parsed) ? parsed : parsed.entries;
+        } else if (/\.xlsx?$/i.test(part.name)) {
+          /* xlsx 需要原始字节（parseXlsx 内部自己解压），返回二维数组直接映射 */
+          if (!part.buf) throw new Error('xlsx 缺少原始字节');
+          rows = rowsToEntries(parseXlsx(part.buf));
+        } else {
+          rows = parseCsv(part.text);
+        }
+        if (!Array.isArray(rows)) throw new Error('文件里没有记录数组');
+        for (const raw of rows) {
+          const { entry, skip } = sanitizeEntry(raw, existingIds);
+          if (skip) { skipped++; continue; }
+          if (!entry) { bad++; continue; }
+          if (seen.has(dupKey(entry))) { dup++; continue; }
+          seen.add(dupKey(entry));
+          d.entries.push(entry);
+          added++;
+        }
       }
-      totalAdded += added; totalDup += dup; totalBad += bad;
+      totalAdded += added; totalDup += dup; totalBad += bad; totalSkipped += skipped;
       fs.renameSync(full, path.join(procDir, `${Date.now()}-${f}`));
-      ok(`${f}：新增 ${added}${dup ? ` · 重复 ${dup}` : ''}${bad ? ` · 无效 ${bad}` : ''}`);
+      ok(`${f}：新增 ${added}${dup ? ` · 重复 ${dup}` : ''}${skipped ? ` · 不计收支 ${skipped}` : ''}${bad ? ` · 无效 ${bad}` : ''}`);
     } catch (err) {
       try { fs.renameSync(full, path.join(failDir, `${Date.now()}-${f}`)); } catch (_) { /* 忽略 */ }
       console.error(paint(`✗ ${f} 处理失败：${err.message}（文件已移入 inbox/failed/）`, RED));
     }
   }
   save(d);
-  console.log(paint(`收件箱处理完毕：新增 ${totalAdded} · 重复跳过 ${totalDup} · 无效跳过 ${totalBad}`, BOLD));
+  console.log(paint(`收件箱处理完毕：新增 ${totalAdded} · 重复跳过 ${totalDup} · 不计收支 ${totalSkipped} · 无效跳过 ${totalBad}`, BOLD));
 }
 
 /* ---------- 帮助 ---------- */
@@ -595,4 +770,6 @@ function main() {
   }
 }
 
-main();
+/* 可导入测试：直接执行时才跑 main（文件被 require 时不产生副作用） */
+if (require.main === module) main();
+else module.exports = { parseXlsx, rowsToEntries, sanitizeEntry, parseCsv };
