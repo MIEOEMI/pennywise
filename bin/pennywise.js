@@ -90,7 +90,7 @@ const VALUE_FLAGS = {
 };
 const BOOL_FLAGS = {
   '--no-note': 'noNote', '--no-merchant': 'noMerchant', '--no-id': 'noId',
-  '--mask': 'mask', '--force': 'force',
+  '--mask': 'mask', '--force': 'force', '--exclude': 'excludeMode',
 };
 const MULTI_FLAGS = { '--replace': 'replace', '-r': 'replace' };
 
@@ -404,7 +404,30 @@ function cmdExport(opts) {
   if (format !== 'csv' && format !== 'json') fail(`--format 应为 csv|json，收到：${opts.format}`);
 
   const d = load();
-  const es = sortByRecency(filterEntries(d.entries, opts));
+  /* --exclude 时 -q/--cat/--type 是「剔除条件」，不能先用来缩小集合：
+     基础集只按日期/月份过滤，再从基础集中剔除命中行 */
+  const baseOpts = opts.excludeMode
+    ? { ...opts, query: undefined, cat: undefined, type: undefined }
+    : opts;
+  let es = sortByRecency(filterEntries(d.entries, baseOpts));
+
+  /* 模糊剔除：--exclude 时，-q/--cat/--type 命中的行从导出中剔除（其余导出） */
+  if (opts.excludeMode) {
+    const before = es.length;
+    es = es.filter((e) => {
+      if (opts.query) {
+        const q = opts.query.toLowerCase();
+        if (`${e.merchant || ''} ${e.note || ''} ${e.category || ''}`.toLowerCase().includes(q)) return false;
+      }
+      if (opts.cat && (e.category || '') === opts.cat) return false;
+      if (opts.type !== undefined) {
+        const t = normalizeType(opts.type);
+        if (t && e.type === t) return false;
+      }
+      return true;
+    });
+    console.error(paint(`[stderr] 模糊剔除：${before - es.length} 条命中（关键词=${opts.query || '-'} 分类=${opts.cat || '-'}），已从导出中剔除`, DIM));
+  }
 
   /* 替换规则："旧=新"，可多次；作用于备注/商家/分类 */
   const rules = [];
@@ -723,9 +746,10 @@ const HELP = `PennyWise v${VERSION} —— 本地记账 CLI（数据存于 ~/.pe
   ingest                               导入收件箱（~/.pennywise/inbox/）里的账单，自动去重、归档
   merge <文件.json> [--force]          合并外部账单（自动按同日期+金额+商家去重）
   export [--format csv|json] [--out 文件]
-        [--from 日期] [--to 日期] [-m 月] [--cat 分类] [-q 关键词]
-        [--no-note] [--no-merchant] [--no-id] [--mask] [--replace "旧=新"]...
-                                       导出账单；可剔除/打码/替换隐私信息后导出
+        [--from 日期] [--to 日期] [-m 月] [--cat 分类] [--type 类型] [-q 关键词]
+        [--exclude] [--no-note] [--no-merchant] [--no-id] [--mask] [--replace "旧=新"]...
+                                       导出账单；--exclude 时命中的行被剔除（模糊剔除），
+                                       --replace 子串替换（模糊），可剔除/打码/替换隐私信息后导出
 
 其他
   help                                 显示本帮助
