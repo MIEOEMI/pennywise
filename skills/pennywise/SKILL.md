@@ -28,11 +28,15 @@ metadata:
 ## 自动管道（已配置 cron）
 
 ```
-cron 每小时 :40 → scripts/auto-sync.sh
+crontab（agent 用户）每小时 :40 → /bin/bash scripts/auto-sync.sh
   ├─ fetch-bills.py   163 邮箱拉账单邮件（认证前 ID 绕 Unsafe Login）→ ~/.pennywise/inbox/
   └─ pennywise ingest  inbox → data.json（去重；成功文件归档 processed/，坏文件 failed/）
 日志：~/.pennywise/auto-sync.log
 ```
+
+脚本自己 export `PATH=$HOME/.local/bin:…` 和 `TZ=Asia/Shanghai`——cron 的默认 PATH 里没有
+`~/.local/bin`（pennywise 装在那里），少这一行会 `pennywise: command not found`。
+2026-11-19 之前这条 cron 并不存在（只有手动跑过），现已装好并用「每分钟跑一次」实测通过后改回 :40。
 
 手动触发同一条链：`bash scripts/auto-sync.sh`，然后 `tail -5 ~/.pennywise/auto-sync.log` 看结果。
 
@@ -50,8 +54,17 @@ cron 每小时 :40 → scripts/auto-sync.sh
 
 ## 行为要点
 
+- **账户互转不算收支**：`category=账户存取`（小荷包/余额宝 转入转出）导入时打 `transfer: true`，
+  `summary` 单列「账户互转 N 笔 · 转入/转出」不计收入支出与预算；`list --type 互转` 可查。
+  给主人报月度数时直接念 summary 的收入/支出，**不要**把互转加回去
+- **「不计收支」不等于不花钱**：支付宝把真实消费（食堂/交通/日用）也标成不计收支，只有分类属于
+  `账户存取/退款/转账/转账红包/信用借还` 才跳过，其余按支出入账；「交易关闭」一律跳过
+- **去重先看订单号**：有 `ref`（支付宝/微信订单号）按 ref 比，没有才退回「日期+类型+金额+分类+备注+商家」
 - 时区坑：本机 /etc/localtime=UTC，cron 进程北京时间 00:00-08:00 记账会落到前一天 →
   替主人记账一律显式传 `-d`（当天按 Asia/Shanghai 算）
-- 测试用 `PENNYWISE_HOME=/tmp/xxx pennywise …`，否则写进真实账本
+- 测试用 `PENNYWISE_HOME=/tmp/xxx pennywise …`，否则写进真实账本；注意 terminal 会话里 export 会一直生效，
+  测完记得 `unset PENNYWISE_HOME` 再操作真实账本
 - 授权码只在 `~/.config/himalaya/config.toml`（600），fetch-bills.py 从那里读，不落第二份
-- 安装：`npm install -g github:MIEOEMI/pennywise`（npmjs 公共源不发，主人已定）
+- 安装：`npm install -g github:MIEOEMI/pennywise`（npmjs 公共源不发，主人已定）；
+  本地装的是 `~/.local/lib/node_modules/pennywise -> ~/workspace/pennywise` 的软链，改完源码立即生效
+- 改完源码记得 `git commit` + `git push origin HEAD`（MIEOEMI 账号），别留一堆未提交的改动
