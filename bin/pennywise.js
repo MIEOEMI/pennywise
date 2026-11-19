@@ -135,7 +135,15 @@ function normalizeType(s) {
   if (t === 'income' || s === '收入' || t === 'in') return 'income';
   /* 支付宝「不计收支」/「其他」等中性记录：不算支出也不算收入，跳过不报错 */
   if (/不计收支|中性交易|other|neutral/.test(t)) return 'skip';
+  /* 账户互转（小荷包/余额宝 转入转出）：钱只是在自己的账户间搬家 */
+  if (t === 'transfer' || s === '互转' || s === '账户互转' || t === 'move') return 'transfer';
   return null;
+}
+/* 账户互转标记：分类属于自有账户间搬钱的记录，summary 既不计收入也不计支出。
+   兼容旧数据（只有 category 没有 transfer 字段）。 */
+const TRANSFER_CAT = /^(账户存取)$/;
+function isTransfer(e) {
+  return Boolean(e) && (e.transfer === true || TRANSFER_CAT.test(String(e.category || '').trim()));
 }
 function checkFilterDates(opts) {
   if (opts.from && !validDate(opts.from)) fail(`--from 日期格式应为 YYYY-MM-DD，收到：${opts.from}`);
@@ -148,8 +156,12 @@ function filterEntries(es, opts) {
   if (opts.cat) out = out.filter((e) => (e.category || '') === opts.cat);
   if (opts.type !== undefined) {
     const t = normalizeType(opts.type);
-    if (!t || t === 'skip') fail(`--type 应为 expense|income（或 支出|收入），收到：${opts.type}`);
-    out = out.filter((e) => e.type === t);
+    if (t === 'transfer') {
+      out = out.filter(isTransfer);
+    } else {
+      if (!t || t === 'skip') fail(`--type 应为 expense|income|transfer（或 支出|收入|互转），收到：${opts.type}`);
+      out = out.filter((e) => e.type === t && !isTransfer(e));
+    }
   }
   if (opts.from) out = out.filter((e) => e.date >= opts.from);
   if (opts.to) out = out.filter((e) => e.date <= opts.to);
@@ -179,6 +191,7 @@ function cmdAdd(type, opts) {
     date,
     ts: Date.now(),
   };
+  if (TRANSFER_CAT.test(String(category).trim())) entry.transfer = true;
   d.entries.push(entry);
   save(d);
   const sign = type === 'income' ? '+' : '-';
@@ -204,9 +217,11 @@ function cmdList(opts) {
   }
   console.log(paint('  ID        日期         类型  分类      金额          商家/备注', BOLD));
   for (const e of es) {
+    const t = isTransfer(e);
     const sign = e.type === 'income' ? '+' : '-';
-    const amt = paint(`${sign}${fmt(e.amount)}`.padStart(12), e.type === 'income' ? GREEN : RED);
-    console.log(`  ${e.id.slice(0, 8)}  ${e.date}  ${e.type === 'income' ? '收入' : '支出'}    `
+    const amt = paint(`${sign}${fmt(e.amount)}`.padStart(12), t ? DIM : (e.type === 'income' ? GREEN : RED));
+    const label = t ? '互转' : (e.type === 'income' ? '收入' : '支出');
+    console.log(`  ${e.id.slice(0, 8)}  ${e.date}  ${label}    `
       + `${(e.category || '').padEnd(8)}  ${amt}  ${paint(displayNote(e), DIM)}`);
   }
   const extra = [];
@@ -233,7 +248,7 @@ function cmdShow(opts) {
   const e = findOne(opts._pos[0], d);
   const rows = [
     ['ID', e.id],
-    ['类型', e.type === 'income' ? '收入' : '支出'],
+    ['类型', isTransfer(e) ? '账户互转（不计收支）' : (e.type === 'income' ? '收入' : '支出')],
     ['金额', (e.type === 'income' ? '+' : '-') + fmt(e.amount)],
     ['分类', e.category || ''],
     ['商家', e.merchant || '（无）'],
@@ -253,17 +268,24 @@ function cmdSummary(opts) {
   if (!validMonth(month)) fail(`月份格式应为 YYYY-MM，收到：${month}`);
   const d = load();
   const es = d.entries.filter((e) => e.date.startsWith(month));
-  const income = es.filter((e) => e.type === 'income').reduce((s, e) => s + e.amount, 0);
-  const expense = es.filter((e) => e.type === 'expense').reduce((s, e) => s + e.amount, 0);
+  const real = es.filter((e) => !isTransfer(e));
+  const transfers = es.filter(isTransfer);
+  const income = real.filter((e) => e.type === 'income').reduce((s, e) => s + e.amount, 0);
+  const expense = real.filter((e) => e.type === 'expense').reduce((s, e) => s + e.amount, 0);
   const net = income - expense;
 
   console.log(paint(`${month} 汇总`, BOLD));
   console.log(`  收入合计  ${paint(fmt(income), GREEN)}`);
   console.log(`  支出合计  ${paint(fmt(expense), RED)}`);
   console.log(`  结余      ${paint(fmt(net), net >= 0 ? GREEN : RED)}`);
+  if (transfers.length) {
+    const tin = transfers.filter((e) => e.type === 'income').reduce((s, e) => s + e.amount, 0);
+    const tout = transfers.filter((e) => e.type !== 'income').reduce((s, e) => s + e.amount, 0);
+    console.log(paint(`  账户互转  ${transfers.length} 笔 · 转入 ${fmt(tin)} / 转出 ${fmt(tout)}（不计收支）`, DIM));
+  }
 
   const byCat = new Map();
-  for (const e of es) {
+  for (const e of real) {
     if (e.type === 'expense') byCat.set(e.category, (byCat.get(e.category) || 0) + e.amount);
   }
   if (byCat.size) {
@@ -324,7 +346,17 @@ function sanitizeEntry(raw, existingIds) {
   let type = raw.type;
   if (type === '支出') type = 'expense';
   if (type === '收入') type = 'income';
-  const norm = normalizeType(type);
+  const norm0 = normalizeType(type);
+  /* 支付宝把「小荷包(生活费/零钱/科研金库)」付款的消费标成「不计收支」，
+     但这些是真实消费（食堂、奶茶、日用、交通…）。只有分类属于资金搬运的
+     （账户存取/退款/转账/信用借还）才真正跳过，其余按支出入账。 */
+  const NEUTRAL_SKIP_CAT = /^(账户存取|退款|转账|转账红包|信用借还|收入)$/;
+  if (norm0 === 'skip' && /不计收支/.test(String(type || ''))) {
+    const cat = String(raw.category || '').trim();
+    if (!cat || NEUTRAL_SKIP_CAT.test(cat)) return { skip: true };
+    type = 'expense';
+  }
+  const norm = type === 'expense' ? 'expense' : norm0;
   if (norm === 'skip' || norm === undefined) return { skip: true }; // 中性/缺类型：安静跳过，不算无效
   /* 「交易关闭」= 钱未实际扣/已全额退回，官方统计不计入支出（如押金充值失败） */
   if (/关闭|closed/i.test(String(raw.status || ''))) return { skip: true };
@@ -337,18 +369,21 @@ function sanitizeEntry(raw, existingIds) {
   let id = typeof raw.id === 'string' && /^[0-9a-f-]{8,}$/.test(raw.id) ? raw.id : crypto.randomUUID();
   if (existingIds.has(id)) id = crypto.randomUUID();   // 撞 ID 就换新的
   existingIds.add(id);
-  return {
-    entry: {
-      id,
-      type,
-      amount: Math.round(amount * 100) / 100,
-      category: String(raw.category || (type === 'income' ? '收入' : '其他')),
-      merchant: String(raw.merchant || ''),
-      note: String(raw.note || ''),
-      date,
-      ts: Number.isFinite(Number(raw.ts)) ? Number(raw.ts) : Date.now(),
-    },
+  const category = String(raw.category || (type === 'income' ? '收入' : '其他'));
+  const entry = {
+    id,
+    type,
+    amount: Math.round(amount * 100) / 100,
+    category,
+    merchant: String(raw.merchant || ''),
+    note: String(raw.note || ''),
+    date,
+    ref: String(raw.ref || ''),
+    ts: Number.isFinite(Number(raw.ts)) ? Number(raw.ts) : Date.now(),
   };
+  /* 自有账户间搬钱（小荷包/余额宝 存取）：标记互转，summary 不计收支 */
+  if (TRANSFER_CAT.test(category.trim())) entry.transfer = true;
+  return { entry };
 }
 
 function cmdMerge(opts) {
@@ -366,7 +401,7 @@ function cmdMerge(opts) {
 
   const d = load();
   const existingIds = new Set(d.entries.map((e) => e.id));
-  const dupKey = (e) => `${e.date}|${e.type}|${e.amount}|${e.category}|${e.note}|${e.merchant}`;
+  const dupKey = (e) => (e.ref ? `REF|${e.ref}` : `${e.date}|${e.type}|${e.amount}|${e.category}|${e.note}|${e.merchant}`);
   const seen = new Set(d.entries.map(dupKey));
 
   let added = 0, skippedDup = 0, skippedBad = 0, skippedNeutral = 0;
@@ -507,11 +542,12 @@ const CSV_PATTERNS = [
   [/^(交易时间|交易创建时间|交易日期|日期|date|时间)$/, 'date'],
   [/金额|amount/, 'amount'],
   [/^(收\/?支|交易类型|类型|type|收支)$/, 'type'],
-  [/交易对方|商家|merchant|对方/, 'merchant'],
+  [/^(交易对方|商家|商户|merchant|对方)$/, 'merchant'],
   [/^(备注|note|摘要)$/, 'note'],
   [/^(交易分类|分类|category|类别)$/, 'category'],
   [/^(商品说明|商品|说明)$/, 'note'],
   [/^(交易状态|状态|status)$/, 'status'],
+  [/^(交易订单号|订单号|orderid|ref)$/, 'ref'],
 ];
 function mapHeader(h) {
   const n = String(h || '').toLowerCase().replace(/[\s（）()]/g, '');
@@ -645,7 +681,7 @@ function cmdIngest() {
   fs.mkdirSync(failDir, { recursive: true });
   const d = load();
   const existingIds = new Set(d.entries.map((e) => e.id));
-  const dupKey = (e) => `${e.date}|${e.type}|${e.amount}|${e.category}|${e.note}|${e.merchant}`;
+  const dupKey = (e) => (e.ref ? `REF|${e.ref}` : `${e.date}|${e.type}|${e.amount}|${e.category}|${e.note}|${e.merchant}`);
   const seen = new Set(d.entries.map(dupKey));
   let totalAdded = 0, totalDup = 0, totalBad = 0, totalSkipped = 0;
   /* ZIP 密码候选：~/.pennywise/zip-passwords.txt 每行一个 */
